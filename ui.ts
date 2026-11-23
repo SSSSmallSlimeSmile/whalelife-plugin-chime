@@ -18,7 +18,7 @@ const FIELDS = {
   min_seconds: {
     kind: "number", min: 0, max: 3600,
     label: "太短的回合不响（秒）",
-    hint: "一次回复短于这个秒数就不出声，免得「嗯」「好」也叮一下。填 0 表示不管多短都响。",
+    hint: "一次回复短于这个秒数就不出声，免得「嗯」「好」也叮一下。填 0 表示不管多短都响。计时从你这句话存下来开始，到回复写进记录为止——不是对方收到的那一刻。",
   },
   cooldown_seconds: {
     kind: "number", min: 0, max: 600,
@@ -148,7 +148,6 @@ export function renderPage(cfg: any): string {
 .pg-tip{margin:22px 0 0;padding:14px 16px;border-radius:10px;background:rgba(124,92,255,.07);border:1px solid rgba(124,92,255,.22);font-size:13px;line-height:1.7}
 .pg-tip b{display:block;font-weight:700;font-size:14px;color:#6d4aff;margin:0 0 6px}
 .pg-tip p{margin:0;color:#797e8c}
-#msg{display:none}
 @media(max-width:760px){.panel-body .pg-pair{grid-template-columns:1fr}}
 </style></head><body>
 <form id="f">
@@ -193,7 +192,10 @@ document.getElementById("test").addEventListener("click", async () => {
   try {
     const res = await fetch("/plugins/chime/test", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok || body.ok === false) throw new Error(body.error || ("HTTP " + res.status));
+    if (!res.ok || body.ok === false) {
+      const prefix = body.requested === true ? "" : "";
+      throw new Error(prefix + (body.error || ("HTTP " + res.status)));
+    }
     show("ok", Array.isArray(body.lines) ? body.lines.join(String.fromCharCode(10)) : (body.detail || body.text || "正常"));
   } catch (error) {
     show("err", "测试失败：" + (error?.message || error));

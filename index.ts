@@ -1,28 +1,32 @@
-/*! WhaleLife「提示音」插件：一轮任务真跑完、回复落地之后，在宿主电脑响一声。
+/*! WhaleLife「提示音」插件：一轮任务跑完、回复落盘之后，在宿主电脑响一声。
  *
- * 判据：从「用户这句话落盘」算起，到「回复真的发出去」为止，超过 min_seconds
- * 才响——随口一问不滴滴叫。
+ * 触发点是 channel/reply —— 回复已经存下来了，不是「模型答完」，也不是
+ * 「消息送到对方手上」。别把它当送达回执用。
  *
  * 三条老坑，写在前面，改之前先看一眼：
- * 1. 只认「回复真的发出去」，不认「agent 跑完」——子代理跑完也会宣告结束，
- *    照那个响，你发一句能听两三次。
- * 2. 冷却和占用放在模块级 + 一个临时文件里。插件重载后老实例还挂在事件链上，
- *    两边各自计时就会两声叠一起，后一声把前一声掐断。
+ * 1. 只认回复落盘，不认「agent 跑完」——子代理跑完也会宣告结束，
+ *    照那个响，发一句能听两三次。
+ * 2. 冷却和占用分两层：进程内的变量 + 本实例 data/ 下的一道闸。重载后老实例
+ *    还挂在事件链上，两边各自计时会两声叠一起，后一声把前一声掐断。
+ *    闸必须按实例分开——放临时目录的话，两台宿主会互相等。
  * 3. 用另一个进程放音。同一个进程里两次 winsound 会抢同一个独占通道。
+ *
+ * 放音脚本固定，音效路径和时长作为参数递过去，不往命令里拼。
  *
  * 平台：只在 Windows 上出声（SoundPlayer / WPF MediaPlayer）。别的系统上
  * 插件照常加载，chime_test 会明说「这台机器不出声」，不报错也不假装。
  */
 import type { Context } from "../../core/context.ts";
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readBody, renderPage, sanitize } from "./ui.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WINDOWS = process.platform === "win32";
+const DATA = join(HERE, "data");
 
 const DEFAULTS = {
   enabled: true,
@@ -35,15 +39,79 @@ const DEFAULTS = {
   cooldown_seconds: 3,
   /** 只在这些通道响；空数组表示全响。例：["web"] */
   channels: [] as string[],
-  log: join(HERE, "data", "chime.log"),
+  log: join(DATA, "chime.log"),
 };
 
 type Config = typeof DEFAULTS;
 
-// 模块级：活得比任何一个实例都长。跨进程重启靠文件里那道闸。
-const GUARD_PATH = join(tmpdir(), "whalelife_chime.guard");
+/** 放音脚本：纯 ASCII，参数化。写一次，之后只用不写。 */
+const PLAY_SCRIPT = `param(
+  [string]$Path = "",
+  [int]$Seconds = 0,
+  [string]$Mode = "wav"
+)
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+if ($Mode -eq "beep") {
+  [System.Media.SystemSounds]::Asterisk.Play()
+  Start-Sleep -Milliseconds 800
+  exit 0
+}
+if (-not (Test-Path -LiteralPath $Path)) { exit 2 }
+try {
+  if ($Mode -eq "mp3") {
+    Add-Type -AssemblyName PresentationCore
+    $player = New-Object System.Windows.Media.MediaPlayer
+    $player.Open(([System.Uri]::new($Path)))
+    $player.Play()
+    Start-Sleep -Milliseconds (($Seconds * 1000) + 400)
+    $player.Close()
+  } else {
+    $sound = New-Object System.Media.SoundPlayer $Path
+    $sound.PlaySync()
+  }
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 3
+}
+exit 0
+`;
+
+// 模块级：活得比任何一个实例都长。跨进程重启靠本实例 data/ 下那道闸。
+const GUARD_PATH = join(DATA, "chime.guard");
 let LAST_PLAY = 0;
 let BUSY_UNTIL = 0;
+
+const madeDirs = new Set<string>();
+
+function ensureDir(dir: string): boolean {
+  if (madeDirs.has(dir)) return true;
+  try {
+    mkdirSync(dir, { recursive: true });
+    madeDirs.add(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 把放音脚本落到本实例的 data/ 里，返回路径。内容没变就不重写。 */
+function scriptPath(): string | null {
+  if (!ensureDir(DATA)) return null;
+  const file = join(DATA, "play.ps1");
+  try {
+    if (readFileSync(file, "utf8") === PLAY_SCRIPT) return file;
+  } catch {
+    /* 没有就写 */
+  }
+  try {
+    // 纯 ASCII，不带 BOM 也不会被 5.1 按 ANSI 读歪。
+    writeFileSync(file, PLAY_SCRIPT, "utf8");
+    return file;
+  } catch {
+    return null;
+  }
+}
 
 function guardLeft(): number {
   try {
@@ -55,6 +123,7 @@ function guardLeft(): number {
 }
 
 function guardSet(seconds: number): void {
+  if (!ensureDir(DATA)) return;
   try {
     writeFileSync(GUARD_PATH, (Date.now() / 1000 + seconds).toFixed(3), "utf8");
   } catch {
@@ -70,7 +139,7 @@ function trace(file: string, line: string): void {
     // data/ 不随包发布，全新安装时这个目录不存在；不建的话日志会静默写不进去。
     const dir = dirname(file);
     if (!prepared.has(dir)) {
-      mkdirSync(dir, { recursive: true });
+      if (!ensureDir(dir)) return;
       prepared.add(dir);
     }
     appendFileSync(file, `${new Date().toISOString()} ${line}\n`);
@@ -141,31 +210,77 @@ function pickSound(cfg: Config): { path: string; seconds: number } {
   return { path: raw, seconds: audioSeconds(raw) };
 }
 
-/** 单引号字符串转义：PowerShell 里连续两个单引号表示一个字面单引号。 */
-const psQuote = (text: string) => text.replace(/'/g, "''");
+type Launch = { requested: boolean; error?: string; child?: ChildProcess; mode?: "wav" | "mp3" | "beep" };
 
-/** 另起一个进程去放。返回是否确实发出去了。 */
-function play(path: string): boolean {
-  if (!WINDOWS) return false;
-  const ok = Boolean(path) && existsSync(path);
-  const q = psQuote(path);
-  const script = !ok
-    ? "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 800"
-    : /\.mp3$/i.test(path)
-      // mp3: SoundPlayer 只认 wav，得用 WPF 的 MediaPlayer。等它真正播完再收，别硬切。
-      ? `Add-Type -AssemblyName PresentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open([uri]'${q}'); $p.Play(); Start-Sleep -Milliseconds ${Math.ceil((audioSeconds(path) + 0.4) * 1000)}; $p.Close()`
-      : `(New-Object System.Media.SoundPlayer '${q}').PlaySync()`;
+/**
+ * 起一个进程放音。路径、时长、模式都当参数传，不拼进命令。
+ * hold=true 时保持引用，能等到退出码——用于「测试」按钮，好分清
+ * 「已经发出去」和「播放器自己报错」。
+ */
+function play(path: string, hold = false): Launch {
+  if (!WINDOWS) return { requested: false, error: `当前系统是 ${process.platform}，只有 Windows 能出声` };
+  const script = scriptPath();
+  if (!script) return { requested: false, error: "写不了播放脚本（data 目录不可写）" };
+  const present = Boolean(path) && existsSync(path);
+  const mode = !present ? "beep" : /\.mp3$/i.test(path) ? "mp3" : "wav";
+  const seconds = mode === "beep" ? 0 : Math.ceil(audioSeconds(path));
   try {
     const child = spawn(
       "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
-      { windowsHide: true, stdio: "ignore" },
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        script,
+        present ? path : "",
+        String(seconds),
+        mode,
+      ],
+      { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] },
     );
-    child.unref();
-    return true;
-  } catch {
-    return false;
+    if (!hold) child.unref();
+    return { requested: true, child, mode };
+  } catch (error: any) {
+    return { requested: false, error: error?.message ?? String(error) };
   }
+}
+
+/** PowerShell 的 stderr 可能是 UTF-8，也可能是 GBK。先按 UTF-8 解，见到替换符再退回 GBK。 */
+function decodeError(buf: Buffer): string {
+  const utf8 = buf.toString("utf8");
+  if (!utf8.includes("\uFFFD")) return utf8;
+  try {
+    return new TextDecoder("gbk").decode(buf);
+  } catch {
+    return utf8;
+  }
+}
+
+/** 等播放进程结束，拿到真实结果。 */
+function settle(child: ChildProcess | undefined): Promise<{ ok: boolean; code: number | null; error?: string }> {
+  if (!child) return Promise.resolve({ ok: false, code: null, error: "没起进程" });
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    child.stderr?.on("data", (chunk: Buffer) => {
+      if (chunks.reduce((n, b) => n + b.length, 0) < 4000) chunks.push(Buffer.from(chunk));
+    });
+    child.on("error", (error) => resolve({ ok: false, code: null, error: error.message }));
+    child.on("close", (code) =>
+      resolve({
+        ok: code === 0,
+        code,
+        error:
+          code === 0
+            ? undefined
+            : decodeError(Buffer.concat(chunks)).trim() ||
+              (code === 2 ? "音效文件不见了" : `播放器退出码 ${code}`),
+      }),
+    );
+  });
 }
 
 export async function apply(ctx: Context) {
@@ -207,7 +322,7 @@ export async function apply(ctx: Context) {
     }
   });
 
-  // 回复落地 = 这一轮真的发出去了
+  // 回复落盘 = 这一轮结束（不是「对方收到了」）
   ctx.on("channel/reply", async (event) => {
     await reload();
     if (!cfg.enabled || !event || event.transient === true || !allowed(event)) return;
@@ -227,17 +342,39 @@ export async function apply(ctx: Context) {
       trace(cfg.log, `skip guard_left=${left.toFixed(2)}s`);
       return;
     }
-    if (!play(wav)) {
-      trace(cfg.log, "error spawn-failed");
-      ctx.logger.warn(WINDOWS ? "提示音播放失败：起不了 powershell" : "提示音播放失败：当前系统不出声");
+    const shot = play(wav);
+    if (!shot.requested) {
+      trace(cfg.log, `error ${shot.error ?? "spawn-failed"}`);
+      ctx.logger.warn(`提示音没响：${shot.error ?? "起不了 powershell"}`);
       return;
     }
     LAST_PLAY = now;
     BUSY_UNTIL = now + duration + 0.05;
     guardSet(duration + 0.05);
-    trace(cfg.log, `play dur=${duration.toFixed(2)}s elapsed=${elapsed.toFixed(1)}s`);
-    ctx.logger.info(`提示音已响，本轮 ${elapsed.toFixed(1)}s`);
+    trace(cfg.log, `play-requested dur=${duration.toFixed(2)}s elapsed=${elapsed.toFixed(1)}s`);
+    ctx.logger.info(`提示音已发出，本轮 ${elapsed.toFixed(1)}s`);
+    void settle(shot.child).then((r) => trace(cfg.log, r.ok ? "play-ok" : `play-error ${r.error}`));
   });
+
+  const runTest = async () => {
+    await reload();
+    const shot = play(wav, true);
+    if (!shot.requested) {
+      trace(cfg.log, `test requested=false ${shot.error ?? ""}`);
+      return { ok: false, requested: false, error: shot.error ?? "没发出去" };
+    }
+    const done = await settle(shot.child);
+    trace(cfg.log, `test requested=true ok=${done.ok} code=${done.code ?? "-"}`);
+    if (!done.ok) {
+      return {
+        ok: false,
+        requested: true,
+        error: `已经交给播放器，但播放器报错：${done.error ?? `退出码 ${done.code}`}`,
+      };
+    }
+    const used = shot.mode === "beep" ? `系统提示音（音效文件读不到：${wav || "未配置"}）` : wav;
+    return { ok: true, requested: true, detail: `已播放：${used}` };
+  };
 
   ctx.tools.register({
     name: "chime_test",
@@ -245,11 +382,9 @@ export async function apply(ctx: Context) {
     schema: { type: "object", properties: {}, required: [] },
     danger: "safe",
     run: async () => {
-      await reload();
-      const ok = play(wav);
-      trace(cfg.log, `test ok=${ok}`);
-      if (ok) return "已发出提示音";
-      return WINDOWS ? "播放失败：起不了 powershell" : `播放失败：${process.platform} 上不出声，只有 Windows 支持`;
+      const r = await runTest();
+      if (r.ok) return r.detail ?? "已发出提示音";
+      return WINDOWS ? `播放失败：${r.error}` : `播放失败：${process.platform} 上不出声，只有 Windows 支持`;
     },
   });
 
@@ -259,17 +394,11 @@ export async function apply(ctx: Context) {
       res.end(JSON.stringify(body));
     };
     try {
-      await reload();
-      const ok = play(wav);
-      trace(cfg.log, `test ok=${ok}`);
-      if (!ok)
-        return reply(500, {
-          ok: false,
-          error: WINDOWS ? "起不了 powershell，声音没发出去" : `${process.platform} 上不出声，只有 Windows 支持`,
-        });
-      return reply(200, { ok: true, detail: `已发出：${wav || "系统提示音"}` });
+      const r = await runTest();
+      if (!r.ok) return reply(500, { ok: false, requested: r.requested === true, error: r.error });
+      return reply(200, { ok: true, requested: true, detail: r.detail });
     } catch (error: any) {
-      return reply(500, { ok: false, error: error?.message ?? String(error) });
+      return reply(500, { ok: false, requested: false, error: error?.message ?? String(error) });
     }
   });
 
