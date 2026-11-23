@@ -1,0 +1,6 @@
+id: chime
+name: 提示音
+description: 一轮任务跑完、回复真的发出去之后，在宿主电脑上响一声；太短的回合不响
+version: 0.2.0
+apiVersion: "1.0.0"
+depends: [web, tools]
